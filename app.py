@@ -1,1254 +1,779 @@
-import streamlit as st
-import pandas as pd
-import numpy as np
-import re
+
 import io
+import re
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import streamlit as st
 from rapidfuzz import fuzz, process
 from openpyxl import load_workbook
 from openpyxl.styles import PatternFill, Font, Alignment
 from openpyxl.utils import get_column_letter
 
 
-# ============================================================
-# PAGE CONFIG
-# ============================================================
-
 st.set_page_config(
-    page_title="Excel Multi-Sheet Data Matcher",
+    page_title="Excel Intelligence & Matcher",
     page_icon="🔎",
     layout="wide",
-    initial_sidebar_state="expanded"
+    initial_sidebar_state="expanded",
 )
-
-
-# ============================================================
-# CUSTOM CSS
-# ============================================================
 
 st.markdown("""
 <style>
-
-.main-title {
-    font-size: 34px;
-    font-weight: 700;
-    margin-bottom: 5px;
-}
-
-.subtitle {
-    color: #6b7280;
-    font-size: 16px;
-    margin-bottom: 20px;
-}
-
-.section-title {
-    font-size: 22px;
-    font-weight: 650;
-    margin-top: 15px;
-    margin-bottom: 10px;
-}
-
-.file-card {
-    padding: 15px;
-    border-radius: 10px;
-    border: 1px solid #ddd;
-    margin-bottom: 10px;
-}
-
+.block-container {padding-top: 1.2rem; padding-bottom: 2rem;}
+.app-title {font-size: 2.1rem; font-weight: 750; margin-bottom: .1rem;}
+.app-subtitle {color:#667085; margin-bottom:1rem;}
 .metric-card {
-    padding: 15px;
-    border-radius: 10px;
-    border: 1px solid #ddd;
-    background-color: #fafafa;
+    border:1px solid #e5e7eb; border-radius:12px; padding:14px;
+    background:#fff; min-height:105px;
 }
-
-.stButton > button {
-    border-radius: 8px;
-    font-weight: 600;
-}
-
+.small-note {color:#667085; font-size:.88rem;}
+[data-testid="stMetricValue"] {font-size:1.55rem;}
 </style>
 """, unsafe_allow_html=True)
 
 
-# ============================================================
-# SESSION STATE
-# ============================================================
+# ----------------------------- State -----------------------------
 
-if "uploaded_files" not in st.session_state:
-    st.session_state.uploaded_files = {}
+DEFAULT_STATE = {
+    "workbooks": {},
+    "selected_result": None,
+    "analysis_run": False,
+    "analysis_mode": "Common Entries",
+}
+for k, v in DEFAULT_STATE.items():
+    if k not in st.session_state:
+        st.session_state[k] = v
 
-if "analysis_result" not in st.session_state:
-    st.session_state.analysis_result = None
 
+# ----------------------------- Helpers -----------------------------
 
-# ============================================================
-# HELPER FUNCTIONS
-# ============================================================
-
-def normalize_value(value):
-    """
-    Normalize text for comparison.
-    """
-
-    if pd.isna(value):
+def clean_text(v):
+    if pd.isna(v):
         return ""
-
-    value = str(value)
-
-    # Convert to lowercase
-    value = value.lower().strip()
-
-    # Remove extra whitespace
-    value = re.sub(r"\s+", " ", value)
-
-    # Replace common separators
-    value = value.replace("_", " ")
-    value = value.replace("-", " ")
-
-    # Remove punctuation
-    value = re.sub(r"[^\w\s]", "", value)
-
-    # Remove repeated whitespace again
-    value = re.sub(r"\s+", " ", value).strip()
-
-    return value
+    return str(v).strip()
 
 
-def display_value(value):
-    if pd.isna(value):
-        return ""
-
-    return str(value).strip()
-
-
-def get_unique_values(df, column, include_blank=False):
-
-    values = df[column].drop_duplicates()
-
-    if not include_blank:
-        values = values[
-            values.notna() &
-            (values.astype(str).str.strip() != "")
-        ]
-
-    return values.tolist()
+def normalize_value(v):
+    s = clean_text(v).lower()
+    s = s.replace("_", " ").replace("-", " ")
+    s = re.sub(r"\s+", " ", s)
+    s = re.sub(r"[^\w\s]", "", s)
+    return re.sub(r"\s+", " ", s).strip()
 
 
-def build_selection_dataframe(selections):
+def safe_sheet_name(name):
+    return str(name)[:31] if name else "Sheet1"
 
-    records = []
 
+def load_uploaded_workbooks(files):
+    workbooks = {}
+    for f in files:
+        try:
+            raw = f.getvalue()
+            xls = pd.ExcelFile(io.BytesIO(raw))
+            sheets = {}
+            for sheet in xls.sheet_names:
+                df = pd.read_excel(io.BytesIO(raw), sheet_name=sheet)
+                df.columns = [
+                    str(c).strip() if not str(c).startswith("Unnamed:")
+                    else f"Column_{i+1}"
+                    for i, c in enumerate(df.columns)
+                ]
+                df = df.dropna(axis=1, how="all")
+                sheets[sheet] = df
+            workbooks[f.name] = {
+                "raw": raw,
+                "sheets": sheets,
+            }
+        except Exception as e:
+            st.error(f"Could not read **{f.name}**: {e}")
+    return workbooks
+
+
+def source_rows(selections):
+    rows = []
     for item in selections:
-
         df = item["df"]
-        file_name = item["file"]
-        sheet_name = item["sheet"]
-        column = item["column"]
-
-        for idx, value in df[column].items():
-
-            records.append({
-                "File": file_name,
-                "Sheet": sheet_name,
+        col = item["column"]
+        for idx, value in df[col].items():
+            rows.append({
+                "File": item["file"],
+                "Sheet": item["sheet"],
                 "Row": idx + 2,
-                "Column": column,
+                "Column": col,
                 "Value": value,
-                "Normalized": normalize_value(value)
+                "Normalized": normalize_value(value),
             })
+    return pd.DataFrame(rows)
 
-    return pd.DataFrame(records)
 
-
-def exact_common_analysis(selections, include_blank=False):
-
-    all_values = {}
-
+def selected_column_stats(selections):
+    out = []
     for item in selections:
-
-        values = get_unique_values(
-            item["df"],
-            item["column"],
-            include_blank
-        )
-
-        for value in values:
-
-            normalized = normalize_value(value)
-
-            if not normalized and not include_blank:
-                continue
-
-            if normalized not in all_values:
-                all_values[normalized] = {
-                    "display": value,
-                    "sources": set(),
-                    "count": 0
-                }
-
-            all_values[normalized]["sources"].add(
-                f"{item['file']} | {item['sheet']} | {item['column']}"
-            )
-
-            all_values[normalized]["count"] += 1
-
-    total_sources = len(selections)
-
-    result = []
-
-    for normalized, data in all_values.items():
-
-        source_count = len(data["sources"])
-
-        if source_count == total_sources:
-
-            result.append({
-                "Value": data["display"],
-                "Normalized Value": normalized,
-                "Files/Sources": source_count,
-                "Total Occurrences": data["count"],
-                "Sources": "; ".join(sorted(data["sources"]))
-            })
-
-    return pd.DataFrame(result)
-
-
-def distinct_analysis(selections, include_blank=False):
-
-    all_values = {}
-
-    for item in selections:
-
-        values = get_unique_values(
-            item["df"],
-            item["column"],
-            include_blank
-        )
-
-        for value in values:
-
-            normalized = normalize_value(value)
-
-            if not normalized and not include_blank:
-                continue
-
-            if normalized not in all_values:
-                all_values[normalized] = {
-                    "display": value,
-                    "sources": set(),
-                    "occurrences": 0
-                }
-
-            all_values[normalized]["sources"].add(
-                f"{item['file']} | {item['sheet']} | {item['column']}"
-            )
-
-            all_values[normalized]["occurrences"] += 1
-
-    result = []
-
-    for normalized, data in all_values.items():
-
-        result.append({
-            "Value": data["display"],
-            "Normalized Value": normalized,
-            "Number of Sources": len(data["sources"]),
-            "Total Occurrences": data["occurrences"],
-            "Sources": "; ".join(sorted(data["sources"]))
+        s = item["df"][item["column"]]
+        nonblank = s.notna() & (s.astype(str).str.strip() != "")
+        out.append({
+            "File": item["file"],
+            "Sheet": item["sheet"],
+            "Column": item["column"],
+            "Rows": len(s),
+            "Non-Blank": int(nonblank.sum()),
+            "Blank": int((~nonblank).sum()),
+            "Distinct": int(s[nonblank].nunique()),
+            "Duplicate Rows": int(nonblank.sum() - s[nonblank].nunique()),
         })
+    return pd.DataFrame(out)
 
-    return pd.DataFrame(result).sort_values(
-        ["Number of Sources", "Value"],
-        ascending=[False, True]
+
+def workbook_stats(workbooks):
+    rows = []
+    for file, info in workbooks.items():
+        for sheet, df in info["sheets"].items():
+            rows.append({
+                "File": file,
+                "Sheet": sheet,
+                "Rows": len(df),
+                "Columns": len(df.columns),
+                "Cells": int(df.shape[0] * df.shape[1]),
+                "Blank Cells": int(df.isna().sum().sum()),
+                "Distinct Rows": int(len(df.drop_duplicates())),
+            })
+    return pd.DataFrame(rows)
+
+
+def build_value_index(selections):
+    idx = {}
+    for item in selections:
+        s = item["df"][item["column"]]
+        for row_no, value in s.items():
+            norm = normalize_value(value)
+            if not norm:
+                continue
+            idx.setdefault(norm, {
+                "display": clean_text(value),
+                "sources": set(),
+                "occurrences": 0,
+                "locations": [],
+            })
+            src = f"{item['file']} | {item['sheet']} | {item['column']}"
+            idx[norm]["sources"].add(src)
+            idx[norm]["occurrences"] += 1
+            idx[norm]["locations"].append(
+                f"{item['file']} | {item['sheet']} | Row {row_no + 2}"
+            )
+    return idx
+
+
+def common_analysis(selections):
+    idx = build_value_index(selections)
+    n_sources = len(selections)
+    rows = []
+    for norm, d in idx.items():
+        if len(d["sources"]) == n_sources:
+            rows.append({
+                "Value": d["display"],
+                "Sources": len(d["sources"]),
+                "Occurrences": d["occurrences"],
+                "Locations": "; ".join(d["locations"]),
+            })
+    return pd.DataFrame(rows).sort_values(
+        ["Sources", "Value"], ascending=[False, True]
+    ) if rows else pd.DataFrame(
+        columns=["Value", "Sources", "Occurrences", "Locations"]
     )
 
 
-def fuzzy_analysis(
-    selections,
-    threshold=85,
-    include_blank=False
-):
+def distinct_analysis(selections):
+    idx = build_value_index(selections)
+    rows = []
+    for norm, d in idx.items():
+        rows.append({
+            "Value": d["display"],
+            "Sources": len(d["sources"]),
+            "Occurrences": d["occurrences"],
+            "Locations": "; ".join(d["locations"]),
+        })
+    return pd.DataFrame(rows).sort_values(
+        ["Sources", "Value"], ascending=[False, True]
+    ) if rows else pd.DataFrame(
+        columns=["Value", "Sources", "Occurrences", "Locations"]
+    )
 
-    # --------------------------------------------------------
-    # Collect all unique normalized values
-    # --------------------------------------------------------
 
-    values = {}
+def similarity_score(a, b, method):
+    if method == "Token Sort":
+        return fuzz.token_sort_ratio(a, b)
+    if method == "Token Set":
+        return fuzz.token_set_ratio(a, b)
+    return fuzz.WRatio(a, b)
 
-    for item in selections:
 
-        df = item["df"]
-        column = item["column"]
-
-        for value in get_unique_values(
-            df,
-            column,
-            include_blank
-        ):
-
-            normalized = normalize_value(value)
-
-            if not normalized:
-                continue
-
-            if normalized not in values:
-
-                values[normalized] = {
-                    "display": value,
-                    "sources": set(),
-                    "occurrences": 0
-                }
-
-            values[normalized]["sources"].add(
-                f"{item['file']} | {item['sheet']} | {item['column']}"
-            )
-
-            values[normalized]["occurrences"] += 1
-
-    unique_values = list(values.keys())
-
-    # --------------------------------------------------------
-    # Build fuzzy groups
-    # --------------------------------------------------------
+def fuzzy_analysis(selections, threshold, method):
+    idx = build_value_index(selections)
+    values = list(idx.keys())
+    if len(values) < 2:
+        return pd.DataFrame(
+            columns=[
+                "Group", "Representative", "Matched Value",
+                "Similarity %", "Sources", "Occurrences", "Locations"
+            ]
+        )
 
     groups = []
     assigned = set()
 
-    for value in unique_values:
-
+    for value in values:
         if value in assigned:
             continue
 
-        matches = process.extract(
-            value,
-            unique_values,
-            scorer=fuzz.token_sort_ratio,
+        candidates = process.extract(
+            value, values,
+            scorer=lambda a, b, **kwargs: similarity_score(a, b, method),
             score_cutoff=threshold,
-            limit=None
+            limit=None,
         )
 
-        group = []
-
-        for match_value, score, _ in matches:
-
-            if match_value not in group:
-                group.append(match_value)
-
+        group = [m[0] for m in candidates]
         if len(group) > 1:
-
-            for v in group:
-                assigned.add(v)
-
             groups.append(group)
-
-    # --------------------------------------------------------
-    # Generate result
-    # --------------------------------------------------------
+            assigned.update(group)
 
     rows = []
-
-    group_id = 1
-
-    for group in groups:
-
-        canonical = max(
+    for gid, group in enumerate(groups, 1):
+        representative = max(
             group,
-            key=lambda x: len(values[x]["display"])
+            key=lambda x: (len(idx[x]["display"]), len(idx[x]["sources"]))
         )
-
         for value in group:
-
-            if value == canonical:
-                similarity = 100
-            else:
-                similarity = fuzz.token_sort_ratio(
-                    canonical,
-                    value
-                )
-
+            score = 100 if value == representative else similarity_score(
+                representative, value, method
+            )
             rows.append({
-                "Group": group_id,
-                "Representative": values[canonical]["display"],
-                "Matched Value": values[value]["display"],
-                "Similarity %": round(similarity, 1),
-                "Number of Sources": len(
-                    values[value]["sources"]
-                ),
-                "Occurrences": values[value]["occurrences"],
-                "Sources": "; ".join(
-                    sorted(values[value]["sources"])
-                )
+                "Group": gid,
+                "Representative": idx[representative]["display"],
+                "Matched Value": idx[value]["display"],
+                "Similarity %": round(score, 1),
+                "Sources": len(idx[value]["sources"]),
+                "Occurrences": idx[value]["occurrences"],
+                "Locations": "; ".join(idx[value]["locations"]),
             })
 
-        group_id += 1
-
     return pd.DataFrame(rows)
 
 
-def create_detailed_matches(
-    selections,
-    fuzzy_groups,
-    threshold
-):
-
-    if fuzzy_groups.empty:
-        return pd.DataFrame()
-
+def missing_by_source(selections):
+    idx = build_value_index(selections)
     rows = []
-
-    for _, group_row in fuzzy_groups.iterrows():
-
-        representative = group_row["Representative"]
-
-        matched_value = group_row["Matched Value"]
-
-        for item in selections:
-
-            df = item["df"]
-            column = item["column"]
-
-            for idx, value in df[column].items():
-
-                if pd.isna(value):
-                    continue
-
-                similarity = fuzz.token_sort_ratio(
-                    normalize_value(representative),
-                    normalize_value(value)
-                )
-
-                if similarity >= threshold:
-
-                    rows.append({
-                        "Match Group": group_row["Group"],
-                        "Representative": representative,
-                        "Matched Value": value,
-                        "Similarity %": round(similarity, 1),
-                        "File": item["file"],
-                        "Sheet": item["sheet"],
-                        "Column": column,
-                        "Excel Row": idx + 2
-                    })
-
-    return pd.DataFrame(rows)
+    for norm, d in idx.items():
+        if len(d["sources"]) < len(selections):
+            rows.append({
+                "Value": d["display"],
+                "Present In": len(d["sources"]),
+                "Missing From": len(selections) - len(d["sources"]),
+                "Locations": "; ".join(d["locations"]),
+            })
+    return pd.DataFrame(rows).sort_values(
+        ["Present In", "Value"], ascending=[False, True]
+    ) if rows else pd.DataFrame(
+        columns=["Value", "Present In", "Missing From", "Locations"]
+    )
 
 
-def dataframe_to_excel(
-    df,
-    highlight_column=None,
-    highlight_values=None
-):
+def highlight_dataframe(df, mode, threshold):
+    def style(row):
+        styles = pd.Series("", index=row.index)
+        if mode == "Similar Entries" and "Similarity %" in row.index:
+            score = float(row["Similarity %"])
+            if score >= 95:
+                styles[:] = "background-color:#c6efce"
+            elif score >= threshold:
+                styles[:] = "background-color:#fff2cc"
+        else:
+            styles[:] = "background-color:#e8f1fb"
+        return styles
+    return df.style.apply(style, axis=1)
 
+
+def export_excel(sheets):
     output = io.BytesIO()
-
-    with pd.ExcelWriter(
-        output,
-        engine="openpyxl"
-    ) as writer:
-
-        df.to_excel(
-            writer,
-            index=False,
-            sheet_name="Results"
-        )
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        for name, df in sheets.items():
+            df.to_excel(writer, sheet_name=safe_sheet_name(name), index=False)
 
     output.seek(0)
-
     wb = load_workbook(output)
 
-    ws = wb["Results"]
-
-    # Header formatting
     header_fill = PatternFill(
-        start_color="1F4E78",
-        end_color="1F4E78",
-        fill_type="solid"
+        start_color="1F4E78", end_color="1F4E78", fill_type="solid"
     )
+    header_font = Font(color="FFFFFF", bold=True)
 
-    header_font = Font(
-        color="FFFFFF",
-        bold=True
-    )
+    for ws in wb.worksheets:
+        ws.freeze_panes = "A2"
+        ws.auto_filter.ref = ws.dimensions
+        for cell in ws[1]:
+            cell.fill = header_fill
+            cell.font = header_font
+            cell.alignment = Alignment(horizontal="center")
 
-    for cell in ws[1]:
-
-        cell.fill = header_fill
-        cell.font = header_font
-        cell.alignment = Alignment(
-            horizontal="center"
-        )
-
-    # Highlight matched values
-    if highlight_column and highlight_values:
-
-        headers = [
-            cell.value for cell in ws[1]
-        ]
-
-        if highlight_column in headers:
-
-            col_index = headers.index(
-                highlight_column
-            ) + 1
-
-            highlight_fill = PatternFill(
-                start_color="FFF2CC",
-                end_color="FFF2CC",
-                fill_type="solid"
+        for col in ws.columns:
+            letter = get_column_letter(col[0].column)
+            max_len = min(
+                max(len(str(c.value)) if c.value is not None else 0 for c in col) + 2,
+                55,
             )
+            ws.column_dimensions[letter].width = max_len
 
-            for row in range(2, ws.max_row + 1):
-
-                cell = ws.cell(
-                    row=row,
-                    column=col_index
-                )
-
-                if normalize_value(cell.value) in highlight_values:
-
-                    cell.fill = highlight_fill
-
-    # Auto width
-    for column_cells in ws.columns:
-
-        max_length = 0
-
-        column_letter = get_column_letter(
-            column_cells[0].column
-        )
-
-        for cell in column_cells:
-
-            try:
-                max_length = max(
-                    max_length,
-                    len(str(cell.value))
-                )
-            except:
-                pass
-
-        ws.column_dimensions[
-            column_letter
-        ].width = min(max_length + 2, 50)
-
-    final_output = io.BytesIO()
-
-    wb.save(final_output)
-
-    final_output.seek(0)
-
-    return final_output
+    final = io.BytesIO()
+    wb.save(final)
+    final.seek(0)
+    return final.getvalue()
 
 
-# ============================================================
-# HEADER
-# ============================================================
+# ----------------------------- Header -----------------------------
 
+st.markdown('<div class="app-title">🔎 Excel Intelligence & Matcher</div>', unsafe_allow_html=True)
 st.markdown(
-    '<div class="main-title">🔎 Multi-Excel Data Matcher</div>',
-    unsafe_allow_html=True
-)
-
-st.markdown(
-    '<div class="subtitle">'
-    'Compare, find common values, identify distinct entries, '
-    'and detect spelling variations across multiple Excel files.'
-    '</div>',
-    unsafe_allow_html=True
+    '<div class="app-subtitle">'
+    "Load multiple Excel workbooks, organize their data, compare selected columns, "
+    "detect exact/common/distinct values, and discover spelling variations."
+    "</div>",
+    unsafe_allow_html=True,
 )
 
 
-# ============================================================
-# SIDEBAR
-# ============================================================
+# ----------------------------- Sidebar -----------------------------
 
 with st.sidebar:
-
-    st.header("⚙️ Analysis Settings")
-
-    analysis_mode = st.radio(
-        "Analysis Mode",
-        [
-            "Common Entries",
-            "Distinct Entries",
-            "Similar Entries"
-        ]
-    )
-
-    st.divider()
-
-    if analysis_mode == "Similar Entries":
-
-        similarity_threshold = st.slider(
-            "Similarity Threshold",
-            min_value=50,
-            max_value=100,
-            value=85,
-            step=1
-        )
-
-        st.caption(
-            "Higher values require closer spelling matches."
-        )
-
-    include_blank = st.checkbox(
-        "Include blank values",
-        value=False
-    )
-
-    st.divider()
-
-    st.subheader("🔤 Normalization")
-
-    normalize_case = st.checkbox(
-        "Ignore upper/lower case",
-        value=True,
-        disabled=True
-    )
-
-    normalize_spaces = st.checkbox(
-        "Ignore extra spaces",
-        value=True,
-        disabled=True
-    )
-
-    normalize_punctuation = st.checkbox(
-        "Ignore punctuation",
-        value=True,
-        disabled=True
-    )
-
-
-# ============================================================
-# FILE UPLOAD
-# ============================================================
-
-st.markdown(
-    '<div class="section-title">1️⃣ Upload Excel Files</div>',
-    unsafe_allow_html=True
-)
-
-uploaded_files = st.file_uploader(
-    "Upload one or more Excel files",
-    type=["xlsx", "xls"],
-    accept_multiple_files=True
-)
-
-
-if not uploaded_files:
-
-    st.info(
-        "Upload two or more Excel files to begin comparison."
-    )
-
-    st.stop()
-
-
-# ============================================================
-# READ FILES
-# ============================================================
-
-workbooks = {}
-
-for uploaded_file in uploaded_files:
-
-    try:
-
-        excel_file = pd.ExcelFile(
-            uploaded_file
-        )
-
-        sheets = {}
-
-        for sheet in excel_file.sheet_names:
-
-            df = pd.read_excel(
-                uploaded_file,
-                sheet_name=sheet
-            )
-
-            # Remove completely empty columns
-            df = df.dropna(
-                axis=1,
-                how="all"
-            )
-
-            sheets[sheet] = df
-
-        workbooks[
-            uploaded_file.name
-        ] = sheets
-
-    except Exception as e:
-
-        st.error(
-            f"Error reading {uploaded_file.name}: {e}"
-        )
-
-
-# ============================================================
-# WORKBOOK OVERVIEW
-# ============================================================
-
-st.markdown(
-    '<div class="section-title">📁 Uploaded Files</div>',
-    unsafe_allow_html=True
-)
-
-cols = st.columns(
-    min(len(workbooks), 4)
-)
-
-for i, (file_name, sheets) in enumerate(
-    workbooks.items()
-):
-
-    with cols[i % len(cols)]:
-
-        total_rows = sum(
-            len(df)
-            for df in sheets.values()
-        )
-
-        st.metric(
-            file_name,
-            f"{len(sheets)} sheets"
-        )
-
-        st.caption(
-            f"{total_rows:,} total rows"
-        )
-
-
-# ============================================================
-# COLUMN SELECTION
-# ============================================================
-
-st.markdown(
-    '<div class="section-title">'
-    '2️⃣ Select Columns to Compare'
-    '</div>',
-    unsafe_allow_html=True
-)
-
-st.caption(
-    "You can select a different sheet and column from each uploaded workbook."
-)
-
-selections = []
-
-
-for file_name, sheets in workbooks.items():
-
-    with st.expander(
-        f"📄 {file_name}",
-        expanded=True
-    ):
-
-        sheet_names = list(sheets.keys())
-
-        selected_sheet = st.selectbox(
-            "Select Sheet",
-            sheet_names,
-            key=f"sheet_{file_name}"
-        )
-
-        df = sheets[selected_sheet]
-
-        columns = list(df.columns)
-
-        selected_column = st.selectbox(
-            "Select Column",
-            columns,
-            key=f"column_{file_name}"
-        )
-
-        preview_col1, preview_col2 = st.columns(
-            [3, 1]
-        )
-
-        with preview_col1:
-
-            st.dataframe(
-                df[
-                    [selected_column]
-                ].head(10),
-                use_container_width=True,
-                height=250
-            )
-
-        with preview_col2:
-
-            st.metric(
-                "Rows",
-                f"{len(df):,}"
-            )
-
-            st.metric(
-                "Unique",
-                f"{df[selected_column].nunique(dropna=True):,}"
-            )
-
-        selections.append({
-            "file": file_name,
-            "sheet": selected_sheet,
-            "column": selected_column,
-            "df": df
-        })
-
-
-# ============================================================
-# VALIDATION
-# ============================================================
-
-if len(selections) < 2:
-
-    st.warning(
-        "Upload at least two Excel files for comparison."
-    )
-
-    st.stop()
-
-
-# ============================================================
-# ANALYZE BUTTON
-# ============================================================
-
-st.markdown(
-    '<div class="section-title">3️⃣ Run Analysis</div>',
-    unsafe_allow_html=True
-)
-
-run_analysis = st.button(
-    "🚀 Analyze Selected Columns",
-    type="primary",
-    use_container_width=True
-)
-
-
-if run_analysis:
-
-    with st.spinner(
-        "Analyzing selected columns..."
-    ):
-
-        if analysis_mode == "Common Entries":
-
-            result = exact_common_analysis(
-                selections,
-                include_blank
-            )
-
-        elif analysis_mode == "Distinct Entries":
-
-            result = distinct_analysis(
-                selections,
-                include_blank
-            )
-
-        else:
-
-            result = fuzzy_analysis(
-                selections,
-                similarity_threshold,
-                include_blank
-            )
-
-        st.session_state.analysis_result = result
-
-
-# ============================================================
-# RESULTS
-# ============================================================
-
-result = st.session_state.analysis_result
-
-
-if result is None:
-
-    st.info(
-        "Select your columns and click **Analyze Selected Columns**."
-    )
-
-    st.stop()
-
-
-st.markdown(
-    '<div class="section-title">4️⃣ Results</div>',
-    unsafe_allow_html=True
-)
-
-
-# ============================================================
-# METRICS
-# ============================================================
-
-if analysis_mode == "Common Entries":
-
-    total_results = len(result)
-
-    total_files = len(selections)
-
-    c1, c2, c3 = st.columns(3)
-
-    c1.metric(
-        "Common Entries",
-        f"{total_results:,}"
-    )
-
-    c2.metric(
-        "Files Compared",
-        f"{total_files:,}"
-    )
-
-    c3.metric(
-        "Matching Across",
-        f"{total_files} files"
-    )
-
-
-elif analysis_mode == "Distinct Entries":
-
-    c1, c2, c3 = st.columns(3)
-
-    c1.metric(
-        "Distinct Values",
-        f"{len(result):,}"
-    )
-
-    c2.metric(
-        "Total Sources",
-        f"{len(selections):,}"
-    )
-
-    if len(result):
-
-        c3.metric(
-            "Appearing in All Sources",
-            f"{(result['Number of Sources'] == len(selections)).sum():,}"
-        )
-
-
-else:
-
-    c1, c2, c3 = st.columns(3)
-
-    c1.metric(
-        "Similar Groups",
-        f"{result['Group'].nunique() if not result.empty else 0:,}"
-    )
-
-    c2.metric(
-        "Matched Values",
-        f"{len(result):,}"
-    )
-
-    c3.metric(
-        "Threshold",
-        f"{similarity_threshold}%"
-    )
-
-
-# ============================================================
-# RESULT FILTER
-# ============================================================
-
-if not result.empty:
-
-    search_text = st.text_input(
-        "🔍 Search results",
-        placeholder="Type to filter results..."
-    )
-
-    filtered_result = result.copy()
-
-    if search_text:
-
-        mask = filtered_result.astype(
-            str
-        ).apply(
-            lambda col: col.str.contains(
-                search_text,
-                case=False,
-                na=False,
-                regex=False
-            )
-        ).any(axis=1)
-
-        filtered_result = filtered_result[
-            mask
-        ]
-
-else:
-
-    filtered_result = result
-
-
-# ============================================================
-# HIGHLIGHT FUNCTION
-# ============================================================
-
-def highlight_matches(row):
-
-    styles = pd.Series(
-        "",
-        index=row.index
-    )
-
-    if analysis_mode == "Similar Entries":
-
-        if "Similarity %" in row.index:
-
-            similarity = row["Similarity %"]
-
-            if similarity >= 95:
-                styles[:] = "background-color: #c6efce"
-
-            elif similarity >= similarity_threshold:
-                styles[:] = "background-color: #fff2cc"
-
-    else:
-
-        styles[:] = "background-color: #e8f4ff"
-
-    return styles
-
-
-if not filtered_result.empty:
-
-    st.dataframe(
-        filtered_result.style.apply(
-            highlight_matches,
-            axis=1
+    st.header("⚙️ Analysis Controls")
+
+    mode = st.radio(
+        "Analysis",
+        ["Common Entries", "Distinct Entries", "Similar Entries", "Missing by Source"],
+        index=["Common Entries", "Distinct Entries", "Similar Entries", "Missing by Source"].index(
+            st.session_state.analysis_mode
         ),
-        use_container_width=True,
-        height=500
     )
+    st.session_state.analysis_mode = mode
 
-else:
-
-    st.warning(
-        "No matching results found."
-    )
-
-
-# ============================================================
-# FUZZY DETAIL VIEW
-# ============================================================
-
-if (
-    analysis_mode == "Similar Entries"
-    and not result.empty
-):
-
-    st.markdown(
-        '<div class="section-title">'
-        '🔬 Detailed Match Locations'
-        '</div>',
-        unsafe_allow_html=True
-    )
-
-    selected_group = st.selectbox(
-        "Select Match Group",
-        sorted(
-            result["Group"].unique()
+    if mode == "Similar Entries":
+        threshold = st.slider(
+            "Similarity threshold",
+            50, 100, 85, 1,
+            help=(
+                "Controls how close two normalized values must be. "
+                "100 requires an exact match; lower values allow more variation."
+            ),
         )
-    )
 
-    group_data = result[
-        result["Group"] == selected_group
+        method = st.selectbox(
+            "Similarity method",
+            ["Token Sort", "Token Set", "WRatio"],
+            help="Token Set handles additional words well; Token Sort handles word-order changes.",
+        )
+
+        st.caption(
+            f"Current threshold: **{threshold}%**"
+        )
+        if threshold >= 95:
+            st.caption("Very strict: only highly similar values.")
+        elif threshold >= 90:
+            st.caption("Strict: good for minor spelling/format differences.")
+        elif threshold >= 80:
+            st.caption("Balanced: catches many spelling variations; review results.")
+        else:
+            st.caption("Broad: may produce more false matches; manual verification recommended.")
+
+    st.divider()
+    st.caption("Tip: use the Analysis tab after selecting the columns you want to compare.")
+
+
+# ----------------------------- Tabs -----------------------------
+
+tab_load, tab_overview, tab_mapping, tab_analysis, tab_explore, tab_export = st.tabs(
+    [
+        "📥 1. Load Data",
+        "📊 2. Data Overview",
+        "🔗 3. Column Mapping",
+        "🔎 4. Analysis",
+        "🎨 5. Explore",
+        "📤 6. Export",
     ]
+)
 
-    st.dataframe(
-        group_data,
-        use_container_width=True
+
+# ============================================================
+# TAB 1 — LOAD
+# ============================================================
+
+with tab_load:
+    st.subheader("Upload and organize your Excel data")
+
+    files = st.file_uploader(
+        "Upload one or more Excel workbooks",
+        type=["xlsx", "xls"],
+        accept_multiple_files=True,
+        help="Multiple workbooks and multiple sheets per workbook are supported.",
     )
 
-    if st.button(
-        "🔎 Find These Matches in Original Files"
-    ):
+    if files:
+        if st.button("📥 Load / Refresh Workbooks", type="primary"):
+            with st.spinner("Reading workbooks and sheets..."):
+                st.session_state.workbooks = load_uploaded_workbooks(files)
+                st.session_state.analysis_run = False
+                st.session_state.selected_result = None
+            st.success(
+                f"Loaded {len(st.session_state.workbooks)} workbook(s)."
+            )
 
-        detail = create_detailed_matches(
-            selections,
-            group_data,
-            similarity_threshold
+    if st.session_state.workbooks:
+        stats = workbook_stats(st.session_state.workbooks)
+
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Workbooks", stats["File"].nunique())
+        c2.metric("Sheets", len(stats))
+        c3.metric("Total Rows", f"{stats['Rows'].sum():,}")
+        c4.metric("Total Columns", f"{stats['Columns'].sum():,}")
+
+        st.dataframe(stats, use_container_width=True, height=420)
+
+        st.markdown("### Sheet preview")
+        for file, info in st.session_state.workbooks.items():
+            with st.expander(f"📄 {file}"):
+                for sheet, df in info["sheets"].items():
+                    st.markdown(f"**{sheet}** — {len(df):,} rows × {len(df.columns):,} columns")
+                    st.dataframe(df.head(8), use_container_width=True)
+
+
+# ============================================================
+# TAB 2 — OVERVIEW
+# ============================================================
+
+with tab_overview:
+    st.subheader("Data quality and structure")
+
+    if not st.session_state.workbooks:
+        st.info("Load Excel files in Tab 1 first.")
+    else:
+        stats = workbook_stats(st.session_state.workbooks)
+
+        c1, c2, c3, c4, c5 = st.columns(5)
+        c1.metric("Files", stats["File"].nunique())
+        c2.metric("Sheets", len(stats))
+        c3.metric("Rows", f"{stats['Rows'].sum():,}")
+        c4.metric("Columns", f"{stats['Columns'].sum():,}")
+        c5.metric("Blank Cells", f"{stats['Blank Cells'].sum():,}")
+
+        st.markdown("### Sheet-level statistics")
+        st.dataframe(stats, use_container_width=True)
+
+        st.markdown("### Column-level statistics")
+        col_stats = []
+        for file, info in st.session_state.workbooks.items():
+            for sheet, df in info["sheets"].items():
+                for col in df.columns:
+                    s = df[col]
+                    nonblank = s.notna() & (s.astype(str).str.strip() != "")
+                    col_stats.append({
+                        "File": file,
+                        "Sheet": sheet,
+                        "Column": col,
+                        "Rows": len(s),
+                        "Distinct": int(s[nonblank].nunique()),
+                        "Blank": int((~nonblank).sum()),
+                        "Duplicate Values": int(nonblank.sum() - s[nonblank].nunique()),
+                        "Data Type": str(s.dtype),
+                    })
+        st.dataframe(pd.DataFrame(col_stats), use_container_width=True, height=500)
+
+
+# ============================================================
+# TAB 3 — MAPPING
+# ============================================================
+
+with tab_mapping:
+    st.subheader("Select the columns you want to compare")
+
+    if not st.session_state.workbooks:
+        st.info("Load Excel files in Tab 1 first.")
+    else:
+        st.caption(
+            "Choose one sheet and one column from each workbook. "
+            "The application compares the selected columns across all sources."
         )
 
-        if not detail.empty:
+        selections = []
 
+        for i, (file, info) in enumerate(st.session_state.workbooks.items()):
+            with st.expander(f"📄 {file}", expanded=True):
+                sheets = list(info["sheets"].keys())
+                sheet = st.selectbox(
+                    "Sheet",
+                    sheets,
+                    key=f"map_sheet_{i}",
+                )
+                df = info["sheets"][sheet]
+                columns = list(df.columns)
+
+                column = st.selectbox(
+                    "Column",
+                    columns,
+                    key=f"map_col_{i}",
+                )
+
+                a, b, c = st.columns(3)
+                a.metric("Rows", f"{len(df):,}")
+                b.metric("Distinct", f"{df[column].nunique(dropna=True):,}")
+                c.metric("Blank", f"{df[column].isna().sum():,}")
+
+                st.dataframe(
+                    df[[column]].head(10),
+                    use_container_width=True,
+                    height=220,
+                )
+
+                selections.append({
+                    "file": file,
+                    "sheet": sheet,
+                    "column": column,
+                    "df": df,
+                })
+
+        st.session_state.selections = selections
+
+        st.success(
+            f"{len(selections)} source column(s) configured for comparison."
+        )
+
+        selected_stats = selected_column_stats(selections)
+        st.dataframe(selected_stats, use_container_width=True)
+
+
+# ============================================================
+# TAB 4 — ANALYSIS
+# ============================================================
+
+with tab_analysis:
+    st.subheader("Run comparison and matching analysis")
+
+    selections = st.session_state.get("selections", [])
+
+    if len(selections) < 2:
+        st.info("Configure at least two source columns in Tab 3.")
+    else:
+        st.info(
+            f"Mode: **{mode}**. "
+            "Results are generated only from the columns selected in Tab 3."
+        )
+
+        if st.button(
+            "🚀 Run Analysis",
+            type="primary",
+            use_container_width=True,
+        ):
+            with st.spinner("Analyzing values across selected sources..."):
+                if mode == "Common Entries":
+                    result = common_analysis(selections)
+                elif mode == "Distinct Entries":
+                    result = distinct_analysis(selections)
+                elif mode == "Missing by Source":
+                    result = missing_by_source(selections)
+                else:
+                    result = fuzzy_analysis(
+                        selections,
+                        threshold,
+                        method,
+                    )
+
+                st.session_state.selected_result = result
+                st.session_state.analysis_run = True
+
+        result = st.session_state.selected_result
+
+        if result is not None:
+            if mode == "Similar Entries" and not result.empty:
+                groups = result["Group"].nunique()
+                matches = len(result)
+                avg_score = result["Similarity %"].mean()
+
+                c1, c2, c3 = st.columns(3)
+                c1.metric("Similarity Groups", groups)
+                c2.metric("Matched Values", matches)
+                c3.metric("Average Similarity", f"{avg_score:.1f}%")
+            else:
+                c1, c2, c3 = st.columns(3)
+                c1.metric("Result Rows", f"{len(result):,}")
+
+                if "Sources" in result.columns:
+                    c2.metric(
+                        "Max Sources",
+                        f"{result['Sources'].max() if len(result) else 0}"
+                    )
+                if "Occurrences" in result.columns:
+                    c3.metric(
+                        "Occurrences",
+                        f"{result['Occurrences'].sum() if len(result) else 0:,}"
+                    )
+
+            search = st.text_input(
+                "🔍 Search within results",
+                placeholder="Search value, file, source, group...",
+            )
+
+            display = result.copy()
+            if search:
+                mask = display.astype(str).apply(
+                    lambda c: c.str.contains(
+                        search, case=False, na=False, regex=False
+                    )
+                ).any(axis=1)
+                display = display[mask]
+
+            if display.empty:
+                st.warning("No results match the current filter.")
+            else:
+                st.dataframe(
+                    highlight_dataframe(display, mode, threshold if mode == "Similar Entries" else 100),
+                    use_container_width=True,
+                    height=520,
+                )
+
+
+# ============================================================
+# TAB 5 — EXPLORE
+# ============================================================
+
+with tab_explore:
+    st.subheader("Explore selected values and source locations")
+
+    selections = st.session_state.get("selections", [])
+    result = st.session_state.selected_result
+
+    if not selections:
+        st.info("Configure columns in Tab 3 first.")
+    else:
+        selected = source_rows(selections)
+
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Selected Rows", f"{len(selected):,}")
+        c2.metric("Distinct Values", f"{selected['Normalized'].nunique():,}")
+        c3.metric("Source Files", selected["File"].nunique())
+        c4.metric("Source Sheets", selected["Sheet"].nunique())
+
+        st.markdown("### Value explorer")
+
+        query = st.text_input(
+            "Find a value",
+            placeholder="e.g. Goa, Forensic Science, Maharashtra...",
+        )
+
+        explorer = selected.copy()
+
+        if query:
+            explorer = explorer[
+                explorer["Value"].astype(str).str.contains(
+                    query, case=False, na=False, regex=False
+                )
+            ]
+
+        st.dataframe(
+            explorer,
+            use_container_width=True,
+            height=500,
+        )
+
+        if result is not None and mode == "Similar Entries" and not result.empty:
+            st.markdown("### Similarity groups")
+
+            group_ids = sorted(result["Group"].unique())
+            group_id = st.selectbox("Match group", group_ids)
+
+            group = result[result["Group"] == group_id]
             st.dataframe(
-                detail.style.apply(
-                    lambda row: pd.Series(
-                        "background-color: #fff2cc",
-                        index=row.index
-                    ),
-                    axis=1
-                ),
-                use_container_width=True
+                highlight_dataframe(group, mode, threshold),
+                use_container_width=True,
             )
 
-        else:
-
-            st.info(
-                "No detailed matches found."
+            st.caption(
+                "Yellow highlights indicate accepted similarity; green indicates very high similarity."
             )
 
 
 # ============================================================
-# SOURCE-WISE ANALYSIS
+# TAB 6 — EXPORT
 # ============================================================
 
-st.markdown(
-    '<div class="section-title">'
-    '📊 Source-wise Summary'
-    '</div>',
-    unsafe_allow_html=True
-)
+with tab_export:
+    st.subheader("Export analysis and source data")
 
-source_summary = []
+    selections = st.session_state.get("selections", [])
+    result = st.session_state.selected_result
 
-for item in selections:
+    if not selections:
+        st.info("Configure columns in Tab 3 first.")
+    else:
+        selected = source_rows(selections)
+        selected_stats = selected_column_stats(selections)
 
-    df = item["df"]
-    column = item["column"]
+        export_sheets = {
+            "Analysis": result if result is not None else pd.DataFrame(),
+            "Selected_Data": selected,
+            "Column_Stats": selected_stats,
+            "Workbook_Stats": workbook_stats(st.session_state.workbooks),
+        }
 
-    values = df[column]
+        if result is not None and mode == "Similar Entries":
+            export_sheets["Similarity_Groups"] = result
 
-    source_summary.append({
-        "File": item["file"],
-        "Sheet": item["sheet"],
-        "Column": column,
-        "Rows": len(df),
-        "Non-Blank": values.notna().sum(),
-        "Unique Values": values.nunique(
-            dropna=True
+        excel_bytes = export_excel(export_sheets)
+
+        c1, c2 = st.columns(2)
+
+        with c1:
+            st.download_button(
+                "📊 Download Complete Excel Report",
+                data=excel_bytes,
+                file_name="Excel_Intelligence_Report.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+            )
+
+        with c2:
+            csv = (
+                result.to_csv(index=False).encode("utf-8")
+                if result is not None
+                else b""
+            )
+            st.download_button(
+                "⬇️ Download Analysis CSV",
+                data=csv,
+                file_name="analysis_results.csv",
+                mime="text/csv",
+                use_container_width=True,
+                disabled=result is None,
+            )
+
+        st.markdown("### Report contents")
+        st.write(
+            "The Excel report contains the analysis results, all selected source "
+            "rows, column-level statistics, workbook/sheet statistics, and "
+            "similarity groups when fuzzy matching is used."
         )
-    })
 
-source_summary_df = pd.DataFrame(
-    source_summary
-)
+        st.dataframe(
+            pd.DataFrame({
+                "Report Sheet": list(export_sheets.keys()),
+                "Rows": [len(v) for v in export_sheets.values()],
+                "Columns": [len(v.columns) for v in export_sheets.values()],
+            }),
+            use_container_width=True,
+        )
 
-st.dataframe(
-    source_summary_df,
-    use_container_width=True
-)
-
-
-# ============================================================
-# EXPORT
-# ============================================================
-
-st.markdown(
-    '<div class="section-title">'
-    '5️⃣ Export Results'
-    '</div>',
-    unsafe_allow_html=True
-)
-
-export_col1, export_col2, export_col3 = st.columns(3)
-
-
-# ------------------------------------------------------------
-# CSV
-# ------------------------------------------------------------
-
-with export_col1:
-
-    csv_data = filtered_result.to_csv(
-        index=False
-    ).encode("utf-8")
-
-    st.download_button(
-        "⬇️ Download CSV",
-        data=csv_data,
-        file_name="excel_match_results.csv",
-        mime="text/csv",
-        use_container_width=True
-    )
-
-
-# ------------------------------------------------------------
-# EXCEL
-# ------------------------------------------------------------
-
-with export_col2:
-
-    excel_data = dataframe_to_excel(
-        filtered_result
-    )
-
-    st.download_button(
-        "📊 Download Excel",
-        data=excel_data,
-        file_name="excel_match_results.xlsx",
-        mime=(
-            "application/vnd.openxmlformats-officedocument."
-            "spreadsheetml.sheet"
-        ),
-        use_container_width=True
-    )
-
-
-# ------------------------------------------------------------
-# SOURCE DATA EXPORT
-# ------------------------------------------------------------
-
-with export_col3:
-
-    source_data = build_selection_dataframe(
-        selections
-    )
-
-    source_excel = dataframe_to_excel(
-        source_data
-    )
-
-    st.download_button(
-        "📦 Export All Selected Data",
-        data=source_excel,
-        file_name="all_selected_source_data.xlsx",
-        mime=(
-            "application/vnd.openxmlformats-officedocument."
-            "spreadsheetml.sheet"
-        ),
-        use_container_width=True
-    )
-
-
-# ============================================================
-# COMPLETE RAW DATA EXPORT
-# ============================================================
-
-st.markdown(
-    '<div class="section-title">'
-    '📚 Complete Source Data'
-    '</div>',
-    unsafe_allow_html=True
-)
-
-st.caption(
-    "All selected source columns are combined below. "
-    "This is useful for auditing the matching process."
-)
-
-source_data = build_selection_dataframe(
-    selections
-)
-
-st.dataframe(
-    source_data,
-    use_container_width=True,
-    height=400
-)
-
-
-# ============================================================
-# FOOTER
-# ============================================================
 
 st.divider()
-
 st.caption(
-    "Multi-Excel Data Matcher • Exact matching + "
-    "normalization + fuzzy matching • Streamlit"
+    "Excel Intelligence & Matcher • Multi-workbook • Multi-sheet • "
+    "Exact + normalized + fuzzy comparison"
 )
